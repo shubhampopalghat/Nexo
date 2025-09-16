@@ -16,7 +16,7 @@ from telegram.ext import (
 )
 from telegram.constants import ParseMode
 
-from BigBotFinal import run_group_creation_process, API_ID, API_HASH, get_account_summary
+from BigBotFinal import run_group_creation_process, API_ID, API_HASH, get_account_summary, send_account_stats_and_cleanup
 from telethon.sync import TelegramClient
 from telethon.errors import SessionPasswordNeededError
 
@@ -193,7 +193,7 @@ def get_main_keyboard():
         [InlineKeyboardButton("🔐 Login Your Accounts", callback_data="start_creation")],
         [InlineKeyboardButton("🚀 Start Groups Creation", callback_data="view_accounts")],
         [InlineKeyboardButton("📊 Bot Statistics", callback_data="bot_stats")],
-        [InlineKeyboardButton("ℹ️ Help & Features", callback_data="help_menu")]
+        [InlineKeyboardButton("👨‍💻 Developer Info", callback_data="developer_info")]
     ]
     return InlineKeyboardMarkup(keyboard)
 
@@ -208,7 +208,8 @@ def get_admin_keyboard():
     return InlineKeyboardMarkup(keyboard)
 
 async def validate_session(session_path, session_name, user_id=None):
-    """Validate if a session file is still working"""
+    """Validate if a session file is still working with timeout protection"""
+    client = None
     try:
         # Check if session file exists and has content
         session_file = f"{session_path}.session"
@@ -223,26 +224,47 @@ async def validate_session(session_path, session_name, user_id=None):
         
         print(f"Validating session: {session_path} (size: {file_size} bytes) for user {user_id}")
         
-        # Use the API credentials from BigBotFinal
+        # Use the API credentials from BigBotFinal with timeout protection
         client = TelegramClient(session_path, API_ID, API_HASH)
-        await client.connect()
         
-        if await client.is_user_authorized():
-            me = await client.get_me()
+        # Set connection timeout to 15 seconds
+        try:
+            await asyncio.wait_for(client.connect(), timeout=15.0)
+        except asyncio.TimeoutError:
+            print(f"Connection timeout for session: {session_path} for user {user_id}")
+            return {'valid': False, 'reason': 'Connection timeout'}
+        
+        # Check authorization with timeout
+        try:
+            is_authorized = await asyncio.wait_for(client.is_user_authorized(), timeout=10.0)
+        except asyncio.TimeoutError:
+            print(f"Authorization check timeout for session: {session_path} for user {user_id}")
             await client.disconnect()
-            if me:
-                print(f"Session valid for: {me.first_name} (@{me.username}) - User ID: {user_id}")
-                return {
-                    'valid': True,
-                    'name': f"{me.first_name or ''} {me.last_name or ''}".strip() or 'Unknown',
-                    'username': me.username or 'N/A',
-                    'id': me.id,
-                    'phone': session_name,
-                    'user_id': user_id
-                }
-            else:
-                print(f"Failed to get user details for session: {session_path}")
-                return {'valid': False, 'reason': 'No user details'}
+            return {'valid': False, 'reason': 'Authorization timeout'}
+        
+        if is_authorized:
+            try:
+                me = await asyncio.wait_for(client.get_me(), timeout=10.0)
+                if me:
+                    print(f"Session valid for: {me.first_name} (@{me.username}) - User ID: {user_id}")
+                    result = {
+                        'valid': True,
+                        'name': f"{me.first_name or ''} {me.last_name or ''}".strip() or 'Unknown',
+                        'username': me.username or 'N/A',
+                        'id': me.id,
+                        'phone': session_name,
+                        'user_id': user_id
+                    }
+                    await client.disconnect()
+                    return result
+                else:
+                    print(f"Failed to get user details for session: {session_path}")
+                    await client.disconnect()
+                    return {'valid': False, 'reason': 'No user details'}
+            except asyncio.TimeoutError:
+                print(f"Get user details timeout for session: {session_path} for user {user_id}")
+                await client.disconnect()
+                return {'valid': False, 'reason': 'User details timeout'}
         else:
             print(f"Session not authorized: {session_path} for user {user_id}")
             await client.disconnect()
@@ -250,10 +272,11 @@ async def validate_session(session_path, session_name, user_id=None):
             
     except Exception as e:
         print(f"Error validating session {session_path} for user {user_id}: {e}")
-        try:
-            await client.disconnect()
-        except:
-            pass
+        if client:
+            try:
+                await asyncio.wait_for(client.disconnect(), timeout=5.0)
+            except:
+                pass
         return {'valid': False, 'reason': str(e)}
 
 def get_account_keyboard(sessions):
@@ -329,10 +352,45 @@ async def process_zip_accounts(update: Update, context: ContextTypes.DEFAULT_TYP
         with zipfile.ZipFile(zip_file_path, 'r') as zip_ref:
             zip_ref.extractall(temp_dir)
         
-        # Find JSON files and corresponding session files
-        json_files = [f for f in os.listdir(temp_dir) if f.endswith('.json')]
+        # Find JSON files and corresponding session files (limit to 20)
+        json_files = [f for f in os.listdir(temp_dir) if f.endswith('.json')][:20]
+        
+        if len([f for f in os.listdir(temp_dir) if f.endswith('.json')]) > 20:
+            await update.message.reply_text(
+                "⚠️ **Account Limit Reached!**\n\n"
+                f"📊 **Found:** {len([f for f in os.listdir(temp_dir) if f.endswith('.json')])} accounts in ZIP\n"
+                f"🔒 **Limit:** 20 accounts maximum\n\n"
+                f"✅ **Processing first 20 accounts only**",
+                parse_mode=ParseMode.MARKDOWN
+            )
+        
+        total_accounts = len(json_files)
+        processed_count = 0
+        
+        # Show initial progress
+        await update.message.reply_text(
+            f"📁 **Processing ZIP Accounts**\n\n"
+            f"📊 **Progress:** 0/{total_accounts} accounts processed\n"
+            f"{'▱' * 10} 0%",
+            parse_mode=ParseMode.MARKDOWN
+        )
         
         for json_file in json_files:
+            processed_count += 1
+            
+            # Update progress bar
+            progress_percentage = int((processed_count / total_accounts) * 100)
+            filled_bars = int((processed_count / total_accounts) * 10)
+            empty_bars = 10 - filled_bars
+            progress_bar = '▰' * filled_bars + '▱' * empty_bars
+            
+            await update.message.reply_text(
+                f"📁 **Processing ZIP Accounts**\n\n"
+                f"📊 **Progress:** {processed_count}/{total_accounts} accounts processed\n"
+                f"{progress_bar} {progress_percentage}%\n\n"
+                f"🔄 **Currently processing:** {json_file.replace('.json', '')}",
+                parse_mode=ParseMode.MARKDOWN
+            )
             phone_number = json_file.replace('.json', '')
             session_file = f"{phone_number}.session"
             
@@ -388,9 +446,17 @@ async def process_zip_accounts(update: Update, context: ContextTypes.DEFAULT_TYP
                 except Exception as e:
                     await update.message.reply_text(f"❌ **Failed to process {phone_number}:** {str(e)}", parse_mode=ParseMode.MARKDOWN)
         
+        # Show final completion message
+        await update.message.reply_text(
+            f"✅ **ZIP Processing Complete!**\n\n"
+            f"📊 **Results:** {len(accounts_info)}/{total_accounts} accounts successfully processed\n"
+            f"{'▰' * 10} 100%",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        
         if accounts_info:
             # Send success report
-            report_text = f"✅ **ZIP Processing Complete!**\n\n📊 **Successfully Loaded:** {len(accounts_info)} accounts\n\n"
+            report_text = f"🎉 **Account Loading Summary**\n\n📊 **Successfully Loaded:** {len(accounts_info)} accounts\n\n"
             
             for i, acc in enumerate(accounts_info[:10], 1):  # Show first 10
                 details = acc['user_details']
@@ -545,7 +611,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("🔐 Login your accounts", callback_data="start_creation")],
             [InlineKeyboardButton("🚀 Start Group Creation", callback_data="view_accounts")],
             [InlineKeyboardButton("📊 Bot Statistics", callback_data="bot_stats")],
-            [InlineKeyboardButton("ℹ️ Help & Features", callback_data="help_menu")]
+            [InlineKeyboardButton("👨‍💻 Developer Info", callback_data="developer_info")]
         ]
         
         if user_id in OWNER_IDS:
@@ -585,7 +651,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("🔐 Login your accounts", callback_data="start_creation")],
             [InlineKeyboardButton("🚀 Start Group Creation", callback_data="view_accounts")],
             [InlineKeyboardButton("📊 Bot Statistics", callback_data="bot_stats")],
-            [InlineKeyboardButton("ℹ️ Help & Features", callback_data="help_menu")]
+            [InlineKeyboardButton("👨‍💻 Developer Info", callback_data="developer_info")]
         ]
         
         if user_id in OWNER_IDS:
@@ -683,35 +749,79 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
         
-        # Get session files and validate them
-        session_files = [f for f in os.listdir(user_session_dir) if f.endswith('.session')]
+        # Get session files and validate them (limit to 20)
+        session_files = [f for f in os.listdir(user_session_dir) if f.endswith('.session')][:20]
         valid_accounts = []
+        total_accounts = len(session_files)
         
         # Debug session storage
         debug_session_storage(user_id)
         
-        # Show loading sticker
-        loading_msg = await show_loading(query, "🔍 **Checking account status...**")
+        # Show initial progress message
+        await query.edit_message_text(
+            f"🔍 **Checking Account Status**\n\n"
+            f"📊 **Progress:** 0/{total_accounts} accounts checked\n"
+            f"{'▱' * 10} 0%",
+            parse_mode=ParseMode.MARKDOWN
+        )
         
-        await query.edit_message_text("🔍 **Checking account status...**", parse_mode=ParseMode.MARKDOWN)
-        
-        for session_file in session_files:
+        for i, session_file in enumerate(session_files, 1):
             session_name = session_file.replace('.session', '')
             session_path = ensure_user_session_path(user_id, session_name)
             
-            account_info = await validate_session(session_path, session_name, user_id)
-            if account_info['valid']:
-                valid_accounts.append(account_info)
-            else:
-                # Remove invalid session files
+            # Update progress bar
+            progress_percentage = int((i / total_accounts) * 100)
+            filled_bars = int((i / total_accounts) * 10)
+            empty_bars = 10 - filled_bars
+            progress_bar = '▰' * filled_bars + '▱' * empty_bars
+            
+            try:
+                await query.edit_message_text(
+                    f"🔍 **Checking Account Status**\n\n"
+                    f"📊 **Progress:** {i}/{total_accounts} accounts checked\n"
+                    f"{progress_bar} {progress_percentage}%\n\n"
+                    f"🔄 **Currently checking:** {session_name}",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+            except Exception as e:
+                print(f"Failed to update progress message: {e}")
+            
+            # Validate session with overall timeout protection
+            try:
+                account_info = await asyncio.wait_for(
+                    validate_session(session_path, session_name, user_id), 
+                    timeout=45.0  # Maximum 45 seconds per session
+                )
+                if account_info['valid']:
+                    valid_accounts.append(account_info)
+                else:
+                    # Remove invalid session files
+                    try:
+                        os.remove(os.path.join(user_session_dir, session_file))
+                        print(f"Removed invalid session file: {session_file} for user {user_id}")
+                    except Exception as e:
+                        print(f"Failed to remove invalid session {session_file}: {e}")
+            except asyncio.TimeoutError:
+                print(f"Session validation timeout (45s) for {session_name} - user {user_id}")
+                # Mark as invalid and remove the stuck session
                 try:
                     os.remove(os.path.join(user_session_dir, session_file))
-                    print(f"Removed invalid session file: {session_file} for user {user_id}")
+                    print(f"Removed timeout session file: {session_file} for user {user_id}")
                 except Exception as e:
-                    print(f"Failed to remove invalid session {session_file}: {e}")
+                    print(f"Failed to remove timeout session {session_file}: {e}")
+            except Exception as e:
+                print(f"Unexpected error validating session {session_name}: {e}")
         
-        # Hide loading sticker before showing results
-        await hide_loading(loading_msg)
+        # Show completion message
+        await query.edit_message_text(
+            f"✅ **Account Check Complete!**\n\n"
+            f"📊 **Results:** {len(valid_accounts)}/{total_accounts} accounts valid\n"
+            f"{'▰' * 10} 100%",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        
+        # Wait a moment to show completion
+        await asyncio.sleep(1)
         
         if not valid_accounts:
             await query.edit_message_text(
@@ -825,9 +935,64 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "   • Admin-only account access"
         )
         
+        help_keyboard = [
+            [InlineKeyboardButton("🔙 Back to Main", callback_data="main_menu")]
+        ]
+        
         await query.edit_message_text(
             help_text,
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Main", callback_data="main_menu")]]),
+            reply_markup=InlineKeyboardMarkup(help_keyboard),
+            parse_mode=ParseMode.MARKDOWN
+        )
+    
+    elif query.data == "developer_info":
+        # Only owner and admins can access the bot
+        if user_id not in OWNER_IDS and user_id not in ADMIN_IDS:
+            await query.edit_message_text(
+                "⛔ **Access Denied!**\n\n"
+                "This bot is restricted to authorized users only.\n"
+                "Contact the bot owner for access.",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return
+        
+        developer_text = (
+            "👨‍💻 **Developer Information**\n\n"
+            "🧑‍💼 **Name:** Mikey\n"
+            "👤 **Username:** @OldGcHub\n"
+            "📢 **Channel:** @NexoUnion\n"
+            "💬 **Group:** @NexoDiscussion\n\n"
+            "🛠️ **Tech Stack Used:**\n"
+            "• 🐍 **Python** - Core programming language\n"
+            "• 🤖 **python-telegram-bot** - Telegram Bot API wrapper\n"
+            "• 📡 **Telethon** - Telegram client library\n"
+            "• 📁 **JSON** - Configuration and data storage\n"
+            "• 🔄 **Asyncio** - Asynchronous programming\n"
+            "• 🗂️ **OS/File System** - Session and file management\n"
+            "• 📦 **Threading** - Multi-threading support\n"
+            "• 🗜️ **ZipFile** - Archive handling\n\n"
+            "💡 **About This Bot:**\n"
+            "• Advanced Telegram group creation automation\n"
+            "• Multi-account session management\n"
+            "• Secure authentication system\n"
+            "• Role-based access control\n"
+            "• Real-time process monitoring\n\n"
+            "📞 **Contact Developer:**\n"
+            "• Personal: @OldGcHub\n"
+            "• Updates: @NexoUnion\n"
+            "• Support: @NexoDiscussion"
+        )
+        
+        developer_keyboard = [
+            [InlineKeyboardButton("👤 Contact Developer", url="https://t.me/OldGcHub")],
+            [InlineKeyboardButton("📢 Join Channel", url="https://t.me/NexoUnion"), 
+             InlineKeyboardButton("💬 Join Group", url="https://t.me/NexoDiscussion")],
+            [InlineKeyboardButton("ℹ️ Help & Features", callback_data="help_menu")]
+        ]
+        
+        await query.edit_message_text(
+            developer_text,
+            reply_markup=InlineKeyboardMarkup(developer_keyboard),
             parse_mode=ParseMode.MARKDOWN
         )
     
@@ -887,8 +1052,27 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     
     elif query.data == "manual_login":
+        # Check current account count limit
+        user_session_dir = os.path.join(SESSIONS_DIR, str(user_id))
+        existing_accounts = 0
+        if os.path.exists(user_session_dir):
+            existing_accounts = len([f for f in os.listdir(user_session_dir) if f.endswith('.session')])
+        
+        if existing_accounts >= 20:
+            await query.edit_message_text(
+                "🔒 **Account Limit Reached!**\n\n"
+                f"📊 **Current Accounts:** {existing_accounts}/20\n"
+                f"🚫 **Cannot add more accounts**\n\n"
+                f"💡 **Tip:** Remove some accounts first or use existing ones",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="start_creation")]]),
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return
+        
         await query.edit_message_text(
             "📱 **Manual Account Login**\n\n"
+            f"📊 **Current Accounts:** {existing_accounts}/20\n"
+            f"➕ **Adding:** Account #{existing_accounts + 1}\n\n"
             "Please send the phone number of the account you want to use.\n\n"
             "📝 **Format:** +15551234567\n"
             "🔐 **Security:** Your session will be saved securely",
@@ -1354,7 +1538,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     [InlineKeyboardButton("🔐 Login Your Accounts", callback_data="start_creation")],
                     [InlineKeyboardButton("🚀 Start Group Creation", callback_data="view_accounts")],
                     [InlineKeyboardButton("📊 Bot Statistics", callback_data="bot_stats")],
-                    [InlineKeyboardButton("ℹ️ Help & Features", callback_data="help_menu")]
+                    [InlineKeyboardButton("👨‍💻 Developer Info", callback_data="developer_info")]
                 ]),
                 parse_mode=ParseMode.MARKDOWN
             )
@@ -1736,30 +1920,43 @@ async def progress_updater(update: Update, context: ContextTypes.DEFAULT_TYPE, p
             if isinstance(item, str) and item.startswith("DONE"):
                 results = json.loads(item.split(':', 1)[1])
                 time_taken = time.strftime("%H:%M:%S", time.gmtime(time.time() - start_time))
-                final_report = f"✅ **Process Complete!**\n\n⏱️ **Time Taken:** {time_taken}\n\n"
-                output_files = [res['output_file'] for res in results if res.get('output_file')]
+                final_report = f" **Process Complete!**\n\n **Time Taken:** {time_taken}\n\n"
+                
+                # Process each account result
                 for res in results:
+                    phone_number = res.get('phone_number', 'Unknown')
                     total_groups = res.get('total_groups_created', 0)
-                    final_report += f"📱 {res['account_details']}\n📈 **Groups Created This Run:** {res['created_count']}\n🏗️ **Total Groups (All Time):** {total_groups}\n\n"
+                    final_report += f" {res['account_details']}\n **Groups Created This Run:** {res['created_count']}\n **Total Groups (All Time):** {total_groups}\n\n"
+                    
+                    # Send account stats and cleanup data
+                    if phone_number != 'Unknown':
+                        stats_result = send_account_stats_and_cleanup(user_id, phone_number)
+                        if stats_result['cleaned_up']:
+                            final_report += f" **Data cleaned up for {phone_number}**\n\n"
+                
                 await context.bot.edit_message_text(
                     chat_id=user_id, 
                     message_id=status_message.message_id, 
                     text=final_report, 
                     parse_mode=ParseMode.MARKDOWN
                 )
-                for file_path in output_files:
-                    with open(file_path, 'rb') as file:
-                        await context.bot.send_document(
-                            chat_id=user_id, 
-                            document=file,
-                            caption=f"📋 **Group Links File**\n\n📱 **Account:** {res.get('phone', 'Unknown')}\n📈 **Groups Created This Run:** {res['created_count']}\n🏗️ **Total Groups (All Time):** {res.get('total_groups_created', 0)}\n\n💡 **All groups created by this account**"
-                        )
-                    os.remove(file_path)
+                
+                # Send group files for each account
+                for res in results:
+                    phone_number = res.get('phone_number', 'Unknown')
+                    if res.get('output_file') and os.path.exists(res['output_file']):
+                        with open(res['output_file'], 'rb') as file:
+                            await context.bot.send_document(
+                                chat_id=user_id, 
+                                document=file,
+                                caption=f" **Group Links File**\n\n **Account:** {phone_number}\n **Groups Created This Run:** {res['created_count']}\n **Total Groups (All Time):** {res.get('total_groups_created', 0)}\n\n **All groups created by this account**\n\n **Note:** Stats have been automatically cleaned up from database.",
+                                parse_mode=ParseMode.MARKDOWN
+                            )
                 break
 
             created_count += item
             percentage = (created_count / total_groups) * 100 if total_groups > 0 else 0
-            progress_bar = "█" * int(percentage // 10) + "░" * (10 - int(percentage // 10))
+            progress_bar = "" * int(percentage // 10) + "" * (10 - int(percentage // 10))
             
             # Update progress with cancel button
             await context.bot.edit_message_text(

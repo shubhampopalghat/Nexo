@@ -4,6 +4,7 @@ import random
 import json
 import time
 import os
+from datetime import datetime
 from telethon import TelegramClient
 from telethon.tl.functions.channels import CreateChannelRequest
 from telethon.tl.functions.messages import ExportChatInviteRequest
@@ -21,13 +22,29 @@ API_ID = 22566208
 
 API_HASH = "fa18dcf886c0d78f20e849f54be62940"
 
-def get_account_stats_file(phone_number):
-    """Get the stats file path for an account"""
-    return f"{phone_number.replace('+', '')}_stats.json"
+def get_user_folder_path(user_id, phone_number):
+    """Get the user-specific folder path for storing account data"""
+    sessions_dir = 'sessions'
+    user_folder = os.path.join(sessions_dir, str(user_id))
+    os.makedirs(user_folder, exist_ok=True)
+    return user_folder
 
-def load_account_stats(phone_number):
-    """Load existing account statistics"""
-    stats_file = get_account_stats_file(phone_number)
+def get_account_stats_file(user_id, phone_number):
+    """Get the stats file path for an account in user's folder"""
+    user_folder = get_user_folder_path(user_id, phone_number)
+    return os.path.join(user_folder, f"{phone_number.replace('+', '')}_stats.json")
+
+def get_account_groups_file(user_id, phone_number, groups_count):
+    """Get the groups file path with format: accountnumber_groupscount_date.txt"""
+    user_folder = get_user_folder_path(user_id, phone_number)
+    date_str = datetime.now().strftime("%Y%m%d")
+    clean_phone = phone_number.replace('+', '')
+    filename = f"{clean_phone}_{groups_count}_{date_str}.txt"
+    return os.path.join(user_folder, filename)
+
+def load_account_stats(user_id, phone_number):
+    """Load existing account statistics from user's folder"""
+    stats_file = get_account_stats_file(user_id, phone_number)
     if os.path.exists(stats_file):
         try:
             with open(stats_file, 'r', encoding='utf-8') as f:
@@ -42,9 +59,9 @@ def load_account_stats(phone_number):
         "account_info": {}
     }
 
-def save_account_stats(phone_number, stats):
-    """Save account statistics"""
-    stats_file = get_account_stats_file(phone_number)
+def save_account_stats(user_id, phone_number, stats):
+    """Save account statistics to user's folder"""
+    stats_file = get_account_stats_file(user_id, phone_number)
     stats["last_updated"] = time.strftime("%Y-%m-%d %H:%M:%S")
     try:
         with open(stats_file, 'w', encoding='utf-8') as f:
@@ -52,19 +69,37 @@ def save_account_stats(phone_number, stats):
     except Exception as e:
         print(f"Failed to save stats for {phone_number}: {e}")
 
-def get_links_file_path(phone_number):
-    """Get the links file path for an account"""
-    return f"{phone_number.replace('+', '')}_links.txt"
-
-def save_group_link(phone_number, group_title, invite_link):
-    """Save a group link to the account's links file"""
-    links_file = get_links_file_path(phone_number)
+def save_group_link(user_id, phone_number, group_title, invite_link, groups_file_path):
+    """Save a group link to the account's groups file in user's folder"""
     try:
-        with open(links_file, 'a', encoding='utf-8') as f:
-            f.write(f"{invite_link}\n")
-        print(f"Link saved to {links_file}")
+        with open(groups_file_path, 'a', encoding='utf-8') as f:
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            f.write(f"[{timestamp}] {group_title}: {invite_link}\n")
+        print(f"Link saved to {groups_file_path}")
     except Exception as e:
-        print(f"Failed to save link to {links_file}: {e}")
+        print(f"Failed to save link to {groups_file_path}: {e}")
+
+def cleanup_account_data(user_id, phone_number):
+    """Delete account stats and related files after sending data"""
+    try:
+        # Delete stats file
+        stats_file = get_account_stats_file(user_id, phone_number)
+        if os.path.exists(stats_file):
+            os.remove(stats_file)
+            print(f"Deleted stats file: {stats_file}")
+        
+        # Find and delete groups files for this account
+        user_folder = get_user_folder_path(user_id, phone_number)
+        clean_phone = phone_number.replace('+', '')
+        
+        for filename in os.listdir(user_folder):
+            if filename.startswith(f"{clean_phone}_") and filename.endswith('.txt'):
+                file_path = os.path.join(user_folder, filename)
+                os.remove(file_path)
+                print(f"Deleted groups file: {file_path}")
+                
+    except Exception as e:
+        print(f"Error cleaning up account data for {phone_number}: {e}")
 
 async def safe_sleep(seconds: int, reason: str = ""):
     """Safe sleep with logging"""
@@ -79,14 +114,18 @@ async def account_worker(account_info, groups_to_create, messages_to_send, delay
     total_created_this_run = 0
     
     # Load existing account statistics
-    account_stats = load_account_stats(phone_number)
+    account_stats = load_account_stats(user_id, phone_number)
     
-    # Get the links file path
-    links_file = get_links_file_path(phone_number)
+    # Get the groups file path with current count and date
+    groups_file = get_account_groups_file(user_id, phone_number, groups_to_create)
     
-    # Create links file if it doesn't exist
-    if not os.path.exists(links_file):
-        open(links_file, 'w', encoding='utf-8').close()
+    # Create groups file if it doesn't exist
+    if not os.path.exists(groups_file):
+        with open(groups_file, 'w', encoding='utf-8') as f:
+            f.write(f"Group Links for Account: {phone_number}\n")
+            f.write(f"Created on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"Target Groups: {groups_to_create}\n")
+            f.write("=" * 50 + "\n\n")
 
     try:
         # Connect to client
@@ -160,7 +199,7 @@ async def account_worker(account_info, groups_to_create, messages_to_send, delay
                     invite_link = invite_result.link
                     
                     # Save link to file
-                    save_group_link(phone_number, group_title, invite_link)
+                    save_group_link(user_id, phone_number, group_title, invite_link, groups_file)
                     
                     # Update account statistics
                     account_stats["all_group_links"].append({
@@ -215,7 +254,7 @@ async def account_worker(account_info, groups_to_create, messages_to_send, delay
                 continue
         
         # Save updated account statistics
-        save_account_stats(phone_number, account_stats)
+        save_account_stats(user_id, phone_number, account_stats)
         
         # Final delay before disconnecting
         await safe_sleep(10, "Final delay before disconnecting")
@@ -231,27 +270,34 @@ async def account_worker(account_info, groups_to_create, messages_to_send, delay
         return {
             "created_count": total_created_this_run,
             "account_details": account_details,
-            "output_file": links_file if total_created_this_run > 0 else None,
-            "total_groups_created": account_stats["total_groups_created"]
+            "output_file": groups_file if total_created_this_run > 0 else None,
+            "total_groups_created": account_stats["total_groups_created"],
+            "phone_number": phone_number
         }
 
 async def run_group_creation_process(account_config, total_groups, msgs_per_group, delay, messages, progress_queue, user_id=None):
     results = await asyncio.gather(account_worker(account_config, total_groups, messages[:msgs_per_group], delay, progress_queue, user_id))
     progress_queue.put(f"DONE:{json.dumps(results)}")
 
-def get_account_summary(phone_number):
-    """Get a summary of account statistics"""
-    stats = load_account_stats(phone_number)
-    links_file = get_links_file_path(phone_number)
+def get_account_summary(user_id, phone_number):
+    """Get a summary of account statistics from user's folder"""
+    stats = load_account_stats(user_id, phone_number)
     
-    # Count total lines in links file (each line is a group link)
+    # Count total links in all groups files for this account
     total_links = 0
-    if os.path.exists(links_file):
-        try:
-            with open(links_file, 'r', encoding='utf-8') as f:
-                total_links = len([line.strip() for line in f if line.strip()])
-        except:
-            pass
+    user_folder = get_user_folder_path(user_id, phone_number)
+    clean_phone = phone_number.replace('+', '')
+    
+    try:
+        for filename in os.listdir(user_folder):
+            if filename.startswith(f"{clean_phone}_") and filename.endswith('.txt'):
+                file_path = os.path.join(user_folder, filename)
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    # Count lines that contain links (skip header lines)
+                    content = f.read()
+                    total_links += content.count('https://t.me/')
+    except Exception as e:
+        print(f"Error counting links for {phone_number}: {e}")
     
     return {
         "phone_number": phone_number,
@@ -261,3 +307,36 @@ def get_account_summary(phone_number):
         "last_updated": stats["last_updated"],
         "account_info": stats["account_info"]
     }
+
+def send_account_stats_and_cleanup(user_id, phone_number):
+    """Send account statistics and then cleanup the data"""
+    try:
+        # Get account summary
+        summary = get_account_summary(user_id, phone_number)
+        
+        # Find all groups files for this account
+        user_folder = get_user_folder_path(user_id, phone_number)
+        clean_phone = phone_number.replace('+', '')
+        groups_files = []
+        
+        for filename in os.listdir(user_folder):
+            if filename.startswith(f"{clean_phone}_") and filename.endswith('.txt'):
+                groups_files.append(os.path.join(user_folder, filename))
+        
+        # Cleanup data after getting summary
+        cleanup_account_data(user_id, phone_number)
+        
+        return {
+            "summary": summary,
+            "groups_files": groups_files,
+            "cleaned_up": True
+        }
+        
+    except Exception as e:
+        print(f"Error in send_account_stats_and_cleanup for {phone_number}: {e}")
+        return {
+            "summary": None,
+            "groups_files": [],
+            "cleaned_up": False,
+            "error": str(e)
+        }
