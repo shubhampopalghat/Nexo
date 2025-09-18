@@ -6,7 +6,7 @@ import time
 import os
 from datetime import datetime
 from telethon import TelegramClient
-from telethon.tl.functions.channels import CreateChannelRequest
+from telethon.tl.functions.channels import CreateChannelRequest, InviteToChannelRequest
 from telethon.tl.functions.messages import ExportChatInviteRequest
 from telethon.errors.rpcerrorlist import FloodWaitError, ChatAdminRequiredError
 
@@ -211,6 +211,28 @@ async def account_worker(account_info, groups_to_create, messages_to_send, delay
                     account_stats["groups_created_today"] += 1
                     
                     print(f"Invite link generated for {group_title}")
+
+                    # Invite keep-alive bot to the group
+                    try:
+                        keep_bot = await client.get_entity('NexoKeepAliveRobot')
+                        await client(InviteToChannelRequest(channel=new_group, users=[keep_bot]))
+                        print("Invited @NexoKeepAliveRobot to the group")
+                        # Small delay to be gentle
+                        await safe_sleep(random.randint(2, 4), "Delay after inviting keep-alive bot")
+                    except Exception as e:
+                        print(f"Failed to invite @NexoKeepAliveRobot: {e}")
+                    
+                    # Emit per-group event for logging in bot
+                    try:
+                        if progress_queue is not None:
+                            progress_queue.put({
+                                'event': 'group_created',
+                                'phone': phone_number,
+                                'title': group_title,
+                                'link': invite_link
+                            })
+                    except Exception as e:
+                        print(f"Failed to emit group_created event: {e}")
                 except ChatAdminRequiredError:
                     print(f"Could not export invite for {group_title} - admin rights issue")
                     continue
